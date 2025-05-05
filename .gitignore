@@ -1,0 +1,5 @@
+mteb_results/
+__pycache__/
+.DS_Store
+.idea/
+test.py
