@@ -11,41 +11,33 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger('ESE_Moe')
 
-def load_pretrained_model(model_name, model_type, device) -> tuple:
-    """ Loads a pretrained model from HuggingFace.
+def load_pretrained_model(model_name, model_type, device, use_8_bit) -> tuple:
+    """Loads a pretrained model from HuggingFace.
 
     Args:
-        base_model (str): name of model (e.g. "mistralai/Mistral-7B-v0.1")
+        model_name (str): Name of model (e.g. "mistralai/Mistral-7B-v0.1")
         model_type (str): Type of model to load ("deepseek-moe", "Qwen", "OLMoE")
+        device (str): Device to load the model on (e.g. "cuda", "cpu")
 
     Returns:
         tuple(model, tokenizer): Loaded model and tokenizer
     """
-    use_quantization = device.type == "cuda"  # only use quantization on CUDA devices
+    use_quantization = (device.type == "cuda" and use_8_bit)
     logger.info("use_quantization: %s", use_quantization)
     logger.info("Using device: %s", device)
-    
-    # Configuration for 4-bit quantization
-    nf4_config = None
-    if use_quantization:
-        nf4_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16
-        )
-    
-    # Load the tokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    # Load the model based on the specified model type
     if model_type == 'OLMoE':
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            quantization_config=nf4_config,
-            use_cache=False,
-            trust_remote_code=True,
-        ).to(device)
+        if use_quantization:
+            quant_config = BitsAndBytesConfig(load_in_8bit=True)
+            model = OlmoeForCausalLM.from_pretrained(
+                model_name,
+                quantization_config=quant_config,
+                device_map="auto"
+            )
+        else:
+            model = OlmoeForCausalLM.from_pretrained(model_name).bfloat16().to(device)
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
 
@@ -58,19 +50,19 @@ class ESE_Moe(torch.nn.Module):
                  device: str,
                  max_length: int,
                  batch_size: int,
+                 use_8_bit: bool,
                  **kwargs: Any):
         super().__init__()
         self.device = device
         self.model_name_or_path = model_name_or_path
         self.max_length = max_length
         self.batch_size = batch_size
+        self.use_8_bit = use_8_bit
 
         if 'OLMoE' in model_name_or_path:
-            self.model, self.tokenizer = load_pretrained_model(model_name_or_path, "OLMoE",  device=self.device)
+            self.model, self.tokenizer = load_pretrained_model(model_name_or_path, "OLMoE",  device=self.device, use_8_bit=self.use_8_bit)
         else: 
             raise ValueError(f"Unknown model source in path: {model_name_or_path}")
-
-        self.model.to(self.device)
 
     @torch.no_grad()
     def encode(self, 
