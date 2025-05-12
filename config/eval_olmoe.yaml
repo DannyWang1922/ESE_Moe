@@ -1,0 +1,6 @@
+model_name_or_path: allenai/OLMoE-1B-7B-0924
+tasks: "STS"
+batch_size: 128
+max_length: 512
+seed: 42
+use_8_bit: true
