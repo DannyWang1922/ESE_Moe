@@ -1,0 +1,28 @@
+model_name_or_path: google-bert/bert-base-uncased
+task: "sst2"
+batch_size: 128
+max_length: 512
+seed: 42
+
+num_experts: 8
+top_k: 2
+expert_dropout: 0.1
+router_temperature: 0.1
+router_noise_epsilon: "1e-2"
+router_training_noise: true
+use_load_balancing: true
+router_z_loss_coef: "1e-3"
+router_aux_loss_coef: 0.01
+track_expert_metrics: true
+
+output_dir: "./results/bert_moe_sst2"
+num_train_epochs: 5
+per_device_train_batch_size: 16
+per_device_eval_batch_size: 64
+warmup_steps: 500
+weight_decay: 0.01
+logging_dir: "./logs"
+logging_steps: 100
+eval_steps: 500
+save_steps: 500
+fp16: true
