@@ -1,34 +1,13 @@
-# coding=utf-8
-# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
-# Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 """PyTorch BERT model."""
 
 import math
-import os
-import warnings
-from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
-import torch.utils.checkpoint
-from packaging import version
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from transformers.activations import ACT2FN
-from transformers.generation import GenerationMixin
 from transformers.modeling_attn_mask_utils import (
     _prepare_4d_attention_mask_for_sdpa,
     _prepare_4d_causal_attention_mask_for_sdpa,
@@ -36,185 +15,19 @@ from transformers.modeling_attn_mask_utils import (
 from transformers.modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
     BaseModelOutputWithPoolingAndCrossAttentions,
-    CausalLMOutputWithCrossAttentions,
-    MaskedLMOutput,
-    MultipleChoiceModelOutput,
-    NextSentencePredictorOutput,
-    QuestionAnsweringModelOutput,
     SequenceClassifierOutput,
-    TokenClassifierOutput,
 )
 from transformers.modeling_utils import PreTrainedModel
-from transformers.pytorch_utils import apply_chunking_to_forward, find_pruneable_heads_and_indices, prune_linear_layer
-from transformers.utils import (
-    ModelOutput,
-    add_code_sample_docstrings,
-    add_start_docstrings,
-    add_start_docstrings_to_model_forward,
-    get_torch_version,
-    logging,
-    replace_return_docstrings,
-)
-from .configuration_bert import BertConfig
+from transformers.utils import logging
 from transformers.models.bert.modeling_bert import (
     BertAttention,
-    BertIntermediate,
-    BertOutput,
     BertEmbeddings,
-    BertPooler
-    
-    
-    
+    BertPooler    
 )
 from transformers.models.bert.modeling_bert import *
-from transformers.configuration_utils import PretrainedConfig
-
 
 logger = logging.get_logger(__name__)
 
-_CHECKPOINT_FOR_DOC = "google-bert/bert-base-uncased"
-_CONFIG_FOR_DOC = "BertConfig"
-
-class BertMoEConfig(PretrainedConfig):
-    """
-    Configuration class for BertMoE model.
-    
-    This extends the original BertConfig with parameters specific to the
-    Mixture of Experts architecture.
-    """
-    
-    model_type = "bert_moe"
-    
-    def __init__(
-        self,
-        vocab_size=30522,
-        hidden_size=768,
-        num_hidden_layers=12,
-        num_attention_heads=12,
-        intermediate_size=3072,
-        hidden_act="gelu",
-        hidden_dropout_prob=0.1,
-        attention_probs_dropout_prob=0.1,
-        max_position_embeddings=512,
-        type_vocab_size=2,
-        initializer_range=0.02,
-        layer_norm_eps=1e-12,
-        pad_token_id=0,
-        position_embedding_type="absolute",
-        use_cache=True,
-        classifier_dropout=None,
-        # MoE specific parameters
-        num_experts=8,
-        top_k=2,
-        expert_dropout=0.0,
-        expert_init_strategy="identical",  # or "diverse"
-        router_temperature=1.0,
-        router_noise_epsilon=1e-2,
-        router_training_noise=True,
-        use_load_balancing=False,
-        router_z_loss_coef=1e-3,
-        router_aux_loss_coef=0.01,
-        track_expert_metrics=True,
-        parallel_expert_computation=True,
-        **kwargs
-    ):
-        """
-        Initialize BertMoEConfig with MoE-specific parameters.
-        
-        Args:
-            vocab_size: Vocabulary size of the BERT model.
-            hidden_size: Size of the encoder layers and the pooler layer.
-            num_hidden_layers: Number of hidden layers in the Transformer encoder.
-            num_attention_heads: Number of attention heads for each attention layer.
-            intermediate_size: Size of the "intermediate" (feed-forward) layer.
-            hidden_act: The non-linear activation function in the encoder and pooler.
-            hidden_dropout_prob: Dropout probability for all fully connected layers.
-            attention_probs_dropout_prob: Dropout ratio for attention probabilities.
-            max_position_embeddings: The maximum sequence length for positional embeddings.
-            type_vocab_size: The vocabulary size of the `token_type_ids`.
-            initializer_range: The standard deviation of the truncated_normal_initializer.
-            layer_norm_eps: The epsilon used by LayerNorm.
-            pad_token_id: The value used to pad input_ids.
-            position_embedding_type: Type of position embedding.
-            use_cache: Whether or not the model should return the last key/values attentions.
-            classifier_dropout: Dropout probability for classifier.
-            
-            # MoE specific parameters
-            num_experts: Number of expert feed-forward networks per layer.
-            top_k: Number of experts to route each token to.
-            expert_dropout: Probability of dropping out entire experts during training.
-            expert_init_strategy: Strategy for initializing experts ("identical" or "diverse").
-            router_temperature: Temperature for router softmax to control sharpness.
-            router_noise_epsilon: Magnitude of noise to add to router logits during training.
-            router_training_noise: Whether to add noise to router logits during training.
-            use_load_balancing: Whether to use auxiliary load balancing loss.
-            router_z_loss_coef: Coefficient for router z-loss to improve stability.
-            router_aux_loss_coef: Coefficient for router auxiliary losses.
-            track_expert_metrics: Whether to track and log expert utilization metrics.
-            parallel_expert_computation: Whether to compute expert outputs in parallel.
-        """
-        super().__init__(
-            vocab_size=vocab_size,
-            hidden_size=hidden_size,
-            num_hidden_layers=num_hidden_layers,
-            num_attention_heads=num_attention_heads,
-            intermediate_size=intermediate_size,
-            hidden_act=hidden_act,
-            hidden_dropout_prob=hidden_dropout_prob,
-            attention_probs_dropout_prob=attention_probs_dropout_prob,
-            max_position_embeddings=max_position_embeddings,
-            type_vocab_size=type_vocab_size,
-            initializer_range=initializer_range,
-            layer_norm_eps=layer_norm_eps,
-            pad_token_id=pad_token_id,
-            position_embedding_type=position_embedding_type,
-            use_cache=use_cache,
-            classifier_dropout=classifier_dropout,
-            **kwargs
-        )
-        
-        # Store MoE specific parameters
-        self.num_experts = num_experts
-        self.top_k = top_k
-        self.expert_dropout = expert_dropout
-        self.expert_init_strategy = expert_init_strategy
-        self.router_temperature = router_temperature
-        self.router_noise_epsilon = router_noise_epsilon
-        self.router_training_noise = router_training_noise
-        self.use_load_balancing = use_load_balancing
-        self.router_z_loss_coef = router_z_loss_coef
-        self.router_aux_loss_coef = router_aux_loss_coef
-        self.track_expert_metrics = track_expert_metrics
-        self.parallel_expert_computation = parallel_expert_computation
-
-class BertIntermediate(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
-        if isinstance(config.hidden_act, str):
-            self.intermediate_act_fn = ACT2FN[config.hidden_act]
-        else:
-            self.intermediate_act_fn = config.hidden_act
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.intermediate_act_fn(hidden_states)
-        return hidden_states
-
-
-class BertOutput(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-
-    def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
-        return hidden_states
-    
 
 class BertMoEExpert(nn.Module):
     """
@@ -299,7 +112,7 @@ class BertMoEExpertPool(nn.Module):
         self.experts = nn.ModuleList([BertMoEExpert(config) for _ in range(num_experts)])
         
         # Expert initialization strategy
-        self.expert_init_strategy = getattr(config, "expert_init_strategy", "identical")
+        self.expert_init_strategy = config.expert_init_strategy
         
         # Apply initialization strategy
         if self.expert_init_strategy == "diverse":
@@ -307,10 +120,10 @@ class BertMoEExpertPool(nn.Module):
             self._initialize_diverse_experts()
         
         # Optional expert dropout for regularization
-        self.expert_dropout = getattr(config, "expert_dropout", 0.0)
+        self.expert_dropout = config.expert_dropout
         
         # Flag for parallelizing expert computation when possible
-        self.parallel_computation = getattr(config, "parallel_expert_computation", True)
+        self.parallel_computation = config.parallel_expert_computation
     
     def _initialize_diverse_experts(self):
         """
@@ -432,15 +245,15 @@ class BertMoERouter(nn.Module):
         nn.init.kaiming_uniform_(self.router_weights.weight, a=math.sqrt(5))
         
         # Optional: add noise to encourage exploration of different experts
-        self.noise_epsilon = getattr(config, "router_noise_epsilon", 1e-2)
-        self.training_noise = getattr(config, "router_training_noise", True)
+        self.noise_epsilon = config.router_noise_epsilon
+        self.training_noise = config.router_training_noise
         
         # Optional: Temperature for softmax to control sharpness of expert selection
-        self.temperature = getattr(config, "router_temperature", 1.0)
+        self.temperature = config.router_temperature
         
         # Optional: Load balancing parameters
-        self.use_load_balancing = getattr(config, "use_load_balancing", False)
-        self.router_z_loss_coef = getattr(config, "router_z_loss_coef", 1e-3)
+        self.use_load_balancing = config.use_load_balancing
+        self.router_z_loss_coef = config.router_z_loss_coef
 
     def forward(self, hidden_states):
         """
@@ -720,14 +533,14 @@ class BertMoELayer(nn.Module):
         return final_output
         
 
-class BertMoEEncoder(nn.Module):
+class BertMoEEncoder(nn.Module): 
     def __init__(self, config):
         super().__init__()
         self.config = config
         
         # Store MoE specific parameters
-        self.num_experts = getattr(config, "num_experts", 8)  # Default to 8 if not specified
-        self.top_k = getattr(config, "top_k", 2)  # Default to 2 if not specified
+        self.num_experts = config.num_experts  # Default to 8 if not specified
+        self.top_k = config.top_k # Default to 2 if not specified
         
         # Create ModuleList of BertMoELayer instances instead of BertLayer
         self.layer = nn.ModuleList(
@@ -737,7 +550,7 @@ class BertMoEEncoder(nn.Module):
         self.gradient_checkpointing = False
         
         # Optional: Add metrics tracking for MoE (expert utilization, load balance)
-        self.track_expert_metrics = getattr(config, "track_expert_metrics", False)
+        self.track_expert_metrics = config.track_expert_metrics
         
         if self.track_expert_metrics:
             # Initialize metrics storage (will be updated during forward pass)
@@ -763,7 +576,7 @@ class BertMoEEncoder(nn.Module):
         all_self_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         
-		# For load balancing and tracking
+		# For load balancing and tracking (modify 1)
         if self.track_expert_metrics:
             # Reset expert utilization counters
             self.expert_metrics["expert_utilization"] = torch.zeros(self.num_experts, 
@@ -808,7 +621,7 @@ class BertMoEEncoder(nn.Module):
                     output_attentions,
                 )
                 
-                # If tracking expert metrics, update metrics with layer's expert usage
+                # If tracking expert metrics, update metrics with layer's expert usage (modify 2)
                 if self.track_expert_metrics and hasattr(layer_module, "expert_metrics"):
                     self.expert_metrics["expert_utilization"] += layer_module.expert_metrics.get(
                         "expert_utilization", torch.zeros(self.num_experts, device=hidden_states.device)
@@ -826,7 +639,7 @@ class BertMoEEncoder(nn.Module):
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
             
-        # Calculate final expert utilization metrics across all layers
+        # Calculate final expert utilization metrics across all layers (modify 3)
         if self.track_expert_metrics:
             # Normalize by number of layers for average utilization
             self.expert_metrics["expert_utilization"] /= len(self.layer)
@@ -1045,7 +858,7 @@ class BertMoEForSequenceClassification(PreTrainedModel):
         self.config = config
         
         # Load the BertMoE model as the base
-        self.bert = BertMoEModel(config)
+        self.bert_moe = BertMoEModel(config)
         
         # Classification head
         self.dropout = nn.Dropout(config.classifier_dropout or config.hidden_dropout_prob)
@@ -1088,7 +901,7 @@ class BertMoEForSequenceClassification(PreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         
         # Forward pass through the BertMoE base model
-        outputs = self.bert(
+        outputs = self.bert_moe(
             input_ids=input_ids,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
