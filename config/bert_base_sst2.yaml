@@ -1,0 +1,16 @@
+model_name_or_path: google-bert/bert-base-uncased
+task: "stanfordnlp/sst2"
+batch_size: 16
+max_length: 512
+seed: 42
+output_dir: "./results/bert_base_sst2"
+epochs: 10
+earning_rate: 5e-5
+weight_decay: 0.01
+
+warmup_steps: 500
+logging_dir: "./logs"
+logging_steps: 100
+eval_steps: 500
+save_steps: 500
+fp16: False

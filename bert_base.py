@@ -6,6 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
+    BertForSequenceClassification,
     Trainer,
     TrainingArguments,
     EvalPrediction,
@@ -13,10 +14,6 @@ from transformers import (
 )
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 import argparse
-
-# Import the custom BertMoE model
-from models.modeling_bert_moe import BertMoEForSequenceClassification
-from models.configuration_bert_moe import BertMoEConfig
 from functools import partial
 import random
 import yaml
@@ -63,19 +60,19 @@ def compute_metrics(pred: EvalPrediction):
 
 def parse_args():
     config_parser = argparse.ArgumentParser(add_help=False)
-    config_parser.add_argument("--config", type=str, default="config/bert_moe_sst2.yaml", help="Path to YAML config file")
+    config_parser.add_argument("--config", type=str, default="config/bert_base_sst2.yaml", help="Path to YAML config file")
     config_args, remaining_args = config_parser.parse_known_args()    
     config = {} 
     if config_args.config:
         config = load_config_yaml(config_args.config)
 
-    parser = argparse.ArgumentParser(description="Evaluate a causal LM on MTEB")
+    parser = argparse.ArgumentParser(description="Train BERT base model for sequence classification")
     parser.add_argument("--model_name_or_path", type=str, default=config.get("model_name_or_path", "google-bert/bert-base-uncased"), help="Model checkpoint name or path")
     parser.add_argument("--task", type=str, default=config.get("task", "stanfordnlp/sst2"), help="Dataset task to train on")
     parser.add_argument("--batch_size", type=int, default=config.get("batch_size", 16), help="Batch size for training")
     parser.add_argument("--max_length", type=int, default=config.get("max_length", 512), help="Maximum sequence length")
     parser.add_argument('--seed', type=int, default=config.get("seed", 42), help='Specify random seed, default -1')
-    parser.add_argument("--output_dir", type=str, default=config.get("output_dir", "./results/bert_moe_sst2"))
+    parser.add_argument("--output_dir", type=str, default=config.get("output_dir", "./results/bert_base_sst2"))
     parser.add_argument("--epochs", type=int, default=config.get("epochs", 10))
     parser.add_argument("--learning_rate", type=float, default=config.get("learning_rate", 5e-5))
     parser.add_argument("--weight_decay", type=float, default=config.get("weight_decay", 0.01))
@@ -85,17 +82,6 @@ def parse_args():
     parser.add_argument("--eval_steps", type=int, default=config.get("eval_steps", 500))
     parser.add_argument("--save_steps", type=int, default=config.get("save_steps", 500))
     parser.add_argument("--fp16", type=bool, default=config.get("fp16", False))
-
-    parser.add_argument("--num_experts", type=int, default=config.get("num_experts", 8))
-    parser.add_argument("--top_k", type=int, default=config.get("top_k", 2))
-    parser.add_argument("--expert_dropout", type=float, default=config.get("expert_dropout", 0.1))
-    parser.add_argument("--router_temperature", type=float, default=config.get("router_temperature", 0.1))
-    parser.add_argument("--router_noise_epsilon", type=float, default=config.get("router_noise_epsilon", 1e-2))
-    parser.add_argument("--router_training_noise", type=bool, default=config.get("router_training_noise", True))
-    parser.add_argument("--use_load_balancing", type=bool, default=config.get("use_load_balancing", True))
-    parser.add_argument("--router_z_loss_coef", type=float, default=config.get("router_z_loss_coef", 1e-3))
-    parser.add_argument("--router_aux_loss_coef", type=float, default=config.get("router_aux_loss_coef", 0.01))
-    parser.add_argument("--track_expert_metrics", type=bool, default=config.get("track_expert_metrics", True))
     
     args = parser.parse_args(remaining_args)
 
@@ -121,20 +107,11 @@ def main(args):
 
     train_dataset, val_dataset = tokenized_datasets["train"], tokenized_datasets["validation"]
 
-    moe_config = BertMoEConfig(
-        num_labels=num_labels, 
-        num_experts=args.num_experts,
-        top_k=args.top_k,
-        expert_dropout=args.expert_dropout,
-        router_temperature=args.router_temperature,
-        router_noise_epsilon=args.router_noise_epsilon,
-        router_training_noise=args.router_training_noise,
-        use_load_balancing=args.use_load_balancing,
-        router_z_loss_coef=args.router_z_loss_coef,
-        router_aux_loss_coef= args.router_aux_loss_coef,
-        track_expert_metrics=args.track_expert_metrics,
+    # Load standard BERT model for sequence classification
+    model = BertForSequenceClassification.from_pretrained(
+        args.model_name_or_path,
+        num_labels=num_labels
     )
-    model = BertMoEForSequenceClassification(moe_config)
     
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -186,20 +163,7 @@ def main(args):
     trainer.save_model(final_model_path)
     tokenizer.save_pretrained(final_model_path)
     
-    # Analyze expert utilization (if metrics are tracked)
-    if hasattr(model.bert_moe.encoder, "expert_metrics"):
-        print("\nExpert Utilization Metrics:")
-        expert_metrics = model.bert_moe.encoder.expert_metrics
-        
-        # Save expert metrics to txt file
-        expert_metrics_path = os.path.join(args.output_dir, "expert_utilization_metrics.txt")
-        with open(expert_metrics_path, "w") as f:
-            f.write("Expert Utilization Metrics\n")
-            f.write("=========================\n\n")
-            for key, value in expert_metrics.items():
-                print(f"{key}: {value}")
-                f.write(f"{key}: {value}\n")
-        print(f"Expert metrics saved to: {expert_metrics_path}")
+    print("Training completed successfully!")
 
 if __name__ == "__main__":
     args = parse_args()

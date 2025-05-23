@@ -1,13 +1,14 @@
 model_name_or_path: google-bert/bert-base-uncased
 task: "stanfordnlp/sst2"
-batch_size: 128
+batch_size: 16
 max_length: 512
 seed: 42
 output_dir: "./results/bert_moe_sst2"
 epochs: 10
+earning_rate: 5e-5
+weight_decay: 0.01
 
 warmup_steps: 500
-weight_decay: 0.01
 logging_dir: "./logs"
 logging_steps: 100
 eval_steps: 500
@@ -25,4 +26,3 @@ router_z_loss_coef: 1e-3
 router_aux_loss_coef: 0.01
 track_expert_metrics: true
 expert_init_strategy: "identical"
-
