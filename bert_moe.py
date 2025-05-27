@@ -160,22 +160,23 @@ def main(args):
         save_total_limit=1,
     )
     
-    # trainer = Trainer(
-    #     model=model,
-    #     args=training_args,
-    #     train_dataset=train_dataset,
-    #     eval_dataset=val_dataset,
-    #     compute_metrics=compute_metrics,
-    # )
-    trainer = MoETrainer(
+    trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         compute_metrics=compute_metrics,
-        tokenizer=tokenizer,
-        load_balance_loss_weight=args.load_balance_loss_weight,  # Pass the loss weight
     )
+    
+    # trainer = MoETrainer(
+    #     model=model,
+    #     args=training_args,
+    #     train_dataset=train_dataset,
+    #     eval_dataset=val_dataset,
+    #     compute_metrics=compute_metrics,
+    #     tokenizer=tokenizer,
+    #     load_balance_loss_weight=args.load_balance_loss_weight,  # Pass the loss weight
+    # )
     
     print("Training the model...")
     trainer.train()

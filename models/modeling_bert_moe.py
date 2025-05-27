@@ -280,66 +280,8 @@ class BertMoERouter(nn.Module):
         if self.temperature != 1.0:
             router_logits = router_logits / self.temperature
             
-        # # Store variables for potential auxiliary losses
-        # if self.use_load_balancing and self.training:
-        #     # Store for load balancing loss
-        #     # Calculate router probs explicitly to compute auxiliary loss later
-        #     self.router_probs = torch.softmax(router_logits, dim=-1)
-            
-        #     # Calculate auxiliary z-loss to improve numerical stability
-        #     # z-loss = log(sum(exp(logits)))^2
-        #     self.router_z_loss = torch.mean(torch.log(torch.sum(torch.exp(router_logits), dim=-1)) ** 2)
-            
         return router_logits
 
-    # def compute_load_balancing_loss(self, router_probs, router_indices):
-    #     """
-    #     Compute auxiliary load balancing loss to encourage equal expert utilization.
-        
-    #     This loss encourages a uniform distribution of tokens across experts,
-    #     which helps prevent the "rich get richer" phenomenon where certain experts
-    #     receive most of the tokens.
-        
-    #     Args:
-    #         router_probs: Tensor of shape [batch_size, seq_len, num_experts]
-    #             Probabilities for routing each token to each expert.
-                
-    #     Returns:
-    #         load_balancing_loss: Scalar tensor with the load balancing loss.
-    #     """
-    #     if not self.use_load_balancing:
-    #             return torch.tensor(0.0, device=router_probs.device)
-        
-    #     batch_size, seq_len, _ = router_probs.shape
-        
-    #     # 创建one-hot编码的专家分配矩阵 Shape: [batch_size * seq_len, num_experts]
-    #     expert_mask = torch.nn.functional.one_hot(router_indices.reshape(-1, self.top_k), num_classes=self.num_experts).sum(dim=1).float()  # 累加top-k的分配
-    #     # 计算每个专家的token分配比例 Shape: [num_experts]
-    #     tokens_per_expert = expert_mask.sum(dim=0) / (batch_size * seq_len * self.top_k)
-        
-    #     # 计算每个专家的平均路由概率,将概率分配到对应的专家. Shape: [batch_size * seq_len * top_k, num_experts]
-    #     router_probs_flat = router_probs.reshape(-1, 1)
-    #     expert_indices_flat = router_indices.reshape(-1)
-        
-    #     # 创建概率分配矩阵
-    #     expert_probs = torch.zeros(batch_size * seq_len, self.num_experts, device=router_probs.device)
-    #     # 使用scatter_add来累加每个专家的概率
-    #     expert_probs.scatter_add_(1, router_indices.reshape(batch_size * seq_len, self.top_k), router_probs)
-    #     # 每个专家被门控函数分配的平均概率
-    #     mean_expert_probs = expert_probs.mean(dim=0)
-        
-    #     # 使用改进的负载均衡损失：
-    #     # L = cv^2，其中cv是变异系数（标准差/均值）
-    #     # 这比KL散度更稳定且更容易优化
-        
-    #     # 计算token分配的变异系数
-    #     tokens_cv = tokens_per_expert.std() / (tokens_per_expert.mean() + 1e-10)
-    #     # 计算概率分配的变异系数
-    #     probs_cv = mean_expert_probs.std() / (mean_expert_probs.mean() + 1e-10)
-    #     # 组合两个损失
-    #     load_balancing_loss = tokens_cv + probs_cv
-        
-    #     return load_balancing_loss
 
     def compute_load_balancing_loss(self, router_logits, router_indices):
         """

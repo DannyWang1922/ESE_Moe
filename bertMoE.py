@@ -163,21 +163,21 @@ class MoETrainer(Trainer):
         if hasattr(encoder, 'expert_metrics'):
             metrics = encoder.expert_metrics
             
-            # Log expert utilization
-            if 'expert_utilization' in metrics:
-                utilization = metrics['expert_utilization']
-                if isinstance(utilization, torch.Tensor):
-                    # Log per-expert utilization
-                    for expert_idx in range(len(utilization)):
-                        self.log({f"experts/utilization_expert_{expert_idx}": utilization[expert_idx].item()})
+            # # Log expert utilization
+            # if 'expert_utilization' in metrics:
+            #     utilization = metrics['expert_utilization']
+            #     if isinstance(utilization, torch.Tensor):
+            #         # Log per-expert utilization
+            #         for expert_idx in range(len(utilization)):
+            #             self.log({f"experts/utilization_expert_{expert_idx}": utilization[expert_idx].item()})
                     
-                    # Log overall statistics
-                    self.log({
-                        "experts/utilization_mean": utilization.mean().item(),
-                        "experts/utilization_std": utilization.std().item(),
-                        "experts/utilization_min": utilization.min().item(),
-                        "experts/utilization_max": utilization.max().item(),
-                    })
+            #         # Log overall statistics
+            #         self.log({
+            #             "experts/utilization_mean": utilization.mean().item(),
+            #             "experts/utilization_std": utilization.std().item(),
+            #             "experts/utilization_min": utilization.min().item(),
+            #             "experts/utilization_max": utilization.max().item(),
+            #         })
             
             # Log load balance metric
             if 'expert_load_balance' in metrics:
