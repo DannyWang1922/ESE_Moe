@@ -20,6 +20,7 @@ from models.configuration_bert_moe import BertMoEConfig
 from functools import partial
 import random
 import yaml
+from bertMoE import MoETrainer
 
 def set_seed(seed):
     """Set the random seed for reproducibility."""
@@ -96,6 +97,9 @@ def parse_args():
     parser.add_argument("--router_z_loss_coef", type=float, default=config.get("router_z_loss_coef", 1e-3))
     parser.add_argument("--router_aux_loss_coef", type=float, default=config.get("router_aux_loss_coef", 0.01))
     parser.add_argument("--track_expert_metrics", type=bool, default=config.get("track_expert_metrics", True))
+    parser.add_argument("--load_balance_loss_weight", type=float, default=config.get("load_balance_loss_weight", 0.01))
+
+    
     
     args = parser.parse_args(remaining_args)
 
@@ -156,12 +160,21 @@ def main(args):
         save_total_limit=1,
     )
     
-    trainer = Trainer(
+    # trainer = Trainer(
+    #     model=model,
+    #     args=training_args,
+    #     train_dataset=train_dataset,
+    #     eval_dataset=val_dataset,
+    #     compute_metrics=compute_metrics,
+    # )
+    trainer = MoETrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=val_dataset,
         compute_metrics=compute_metrics,
+        tokenizer=tokenizer,
+        load_balance_loss_weight=args.load_balance_loss_weight,  # Pass the loss weight
     )
     
     print("Training the model...")
