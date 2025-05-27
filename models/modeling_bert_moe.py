@@ -576,10 +576,32 @@ class BertMoEEncoder(nn.Module):
         self.num_experts = config.num_experts  # Default to 8 if not specified
         self.top_k = config.top_k # Default to 2 if not specified
         
-        # Create ModuleList of BertMoELayer instances instead of BertLayer
-        self.layer = nn.ModuleList(
-            [BertMoELayer(config, self.num_experts, self.top_k) for _ in range(config.num_hidden_layers)]
-        )
+        # Get MoE layer indices from config
+        # Can be a list of layer indices [0, 2, 4, 6] or "all" for all layers
+        self.moe_layers = getattr(config, 'moe_layers', 'all')
+        
+        # Convert moe_layers to a set of indices for faster lookup
+        if self.moe_layers == 'all':
+            self.moe_layer_indices = set(range(config.num_hidden_layers))
+        elif isinstance(self.moe_layers, (list, tuple)):
+            self.moe_layer_indices = set(self.moe_layers)
+        else:
+            raise ValueError(f"Invalid moe_layers format: {self.moe_layers}. Must be 'all' or a list of layer indices.")
+        
+        # Validate layer indices
+        for idx in self.moe_layer_indices:
+            if not isinstance(idx, int) or idx < 0 or idx >= config.num_hidden_layers:
+                raise ValueError(f"Invalid layer index {idx}. Must be an integer in range [0, {config.num_hidden_layers})")
+        
+        # Create ModuleList with mixed BertMoELayer and BertLayer instances
+        self.layer = nn.ModuleList()
+        for i in range(config.num_hidden_layers):
+            if i in self.moe_layer_indices:
+                # Use MoE layer
+                self.layer.append(BertMoELayer(config, self.num_experts, self.top_k))
+            else:
+                # Use standard BERT layer
+                self.layer.append(BertLayer(config))
         
         self.gradient_checkpointing = False
         
@@ -591,8 +613,9 @@ class BertMoEEncoder(nn.Module):
             self.expert_metrics = {
                 "expert_utilization": torch.zeros(self.num_experts),
                 "expert_load_balance": 0.0,
+                "moe_layers_used": list(self.moe_layer_indices),
             }
-
+    
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -615,6 +638,9 @@ class BertMoEEncoder(nn.Module):
             # Reset expert utilization counters
             self.expert_metrics["expert_utilization"] = torch.zeros(self.num_experts, 
                                                                    device=hidden_states.device)
+            # Count number of MoE layers actually used
+            moe_layers_count = 0
+            
         if self.gradient_checkpointing and self.training:
             if use_cache:
                 logger.warning_once(
@@ -655,11 +681,13 @@ class BertMoEEncoder(nn.Module):
                     output_attentions,
                 )
                 
-                # If tracking expert metrics, update metrics with layer's expert usage (modify 2)
-                if self.track_expert_metrics and hasattr(layer_module, "expert_metrics"):
-                    self.expert_metrics["expert_utilization"] += layer_module.expert_metrics.get(
-                        "expert_utilization", torch.zeros(self.num_experts, device=hidden_states.device)
-                    )
+                # If tracking expert metrics and this is a MoE layer, update metrics
+                if self.track_expert_metrics and i in self.moe_layer_indices:
+                    moe_layers_count += 1
+                    if hasattr(layer_module, "expert_metrics"):
+                        self.expert_metrics["expert_utilization"] += layer_module.expert_metrics.get(
+                            "expert_utilization", torch.zeros(self.num_experts, device=hidden_states.device)
+                        )
 
             hidden_states = layer_outputs[0]
             if use_cache:
@@ -673,10 +701,10 @@ class BertMoEEncoder(nn.Module):
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
             
-        # Calculate final expert utilization metrics across all layers (modify 3)
-        if self.track_expert_metrics:
-            # Normalize by number of layers for average utilization
-            self.expert_metrics["expert_utilization"] /= len(self.layer)
+        # Calculate final expert utilization metrics across all MoE layers
+        if self.track_expert_metrics and moe_layers_count > 0:
+            # Normalize by number of MoE layers for average utilization
+            self.expert_metrics["expert_utilization"] /= moe_layers_count
             
             # Calculate load balance as coefficient of variation (standard deviation / mean)
             utilization = self.expert_metrics["expert_utilization"]

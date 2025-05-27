@@ -27,3 +27,4 @@ router_aux_loss_coef: 0.01
 track_expert_metrics: true
 expert_init_strategy: "identical"
 load_balance_loss_weight: 0.01
+moe_layers: "[11]"

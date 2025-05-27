@@ -87,6 +87,7 @@ def parse_args():
     parser.add_argument("--save_steps", type=int, default=config.get("save_steps", 500))
     parser.add_argument("--fp16", type=bool, default=config.get("fp16", False))
 
+    # MoE specific arguments
     parser.add_argument("--num_experts", type=int, default=config.get("num_experts", 8))
     parser.add_argument("--top_k", type=int, default=config.get("top_k", 2))
     parser.add_argument("--expert_dropout", type=float, default=config.get("expert_dropout", 0.1))
@@ -98,8 +99,11 @@ def parse_args():
     parser.add_argument("--router_aux_loss_coef", type=float, default=config.get("router_aux_loss_coef", 0.01))
     parser.add_argument("--track_expert_metrics", type=bool, default=config.get("track_expert_metrics", True))
     parser.add_argument("--load_balance_loss_weight", type=float, default=config.get("load_balance_loss_weight", 0.01))
-
     
+    # Add MoE layer selection argument
+    parser.add_argument("--moe_layers", type=str, default=config.get("moe_layers", "[11]"),
+                        help="""Specify which layers to use MoE. Options: - 'all' (default) - '[0,2,4,6]': Use MoE for specific layers"""
+    )
     
     args = parser.parse_args(remaining_args)
 
@@ -108,6 +112,34 @@ def parse_args():
         if isinstance(val, str) and val.lower() in {"none", "true", "false"}:
             setattr(args, arg, {"none": None, "true": True, "false": False}[val.lower()])
     return args
+
+
+def process_moe_layers_arg(moe_layers_str):
+    """
+    Process the moe_layers argument into a format the model can use.
+    
+    Args:
+        moe_layers_str: String specifying which layers to use MoE
+        
+    Returns:
+        Processed moe_layers value ('all' or list of integers)
+    """
+    if moe_layers_str == 'all':
+        return 'all'
+    else:
+        try:
+            import ast
+            moe_layers_list = ast.literal_eval(moe_layers_str)
+            if isinstance(moe_layers_list, list):
+                # Validate all elements are integers
+                for idx in moe_layers_list:
+                    if not isinstance(idx, int):
+                        raise ValueError(f"All layer indices must be integers, got {type(idx)}")
+                return moe_layers_list
+            else:
+                raise ValueError(f"moe_layers must be 'all' or a list of integers")
+        except (ValueError, SyntaxError) as e:
+            raise ValueError(f"Invalid moe_layers format: {moe_layers_str}. Must be 'all' or a list like '[0,2,4,6]'") from e
 
 
 def main(args):
@@ -125,6 +157,9 @@ def main(args):
 
     train_dataset, val_dataset = tokenized_datasets["train"], tokenized_datasets["validation"]
 
+    # Process moe_layers argument
+    processed_moe_layers = process_moe_layers_arg(args.moe_layers)
+    
     moe_config = BertMoEConfig(
         num_labels=num_labels, 
         num_experts=args.num_experts,
@@ -135,8 +170,9 @@ def main(args):
         router_training_noise=args.router_training_noise,
         use_load_balancing=args.use_load_balancing,
         router_z_loss_coef=args.router_z_loss_coef,
-        router_aux_loss_coef= args.router_aux_loss_coef,
+        router_aux_loss_coef=args.router_aux_loss_coef,
         track_expert_metrics=args.track_expert_metrics,
+        moe_layers=processed_moe_layers,  # Add the MoE layers configuration
     )
     model = BertMoEForSequenceClassification(moe_config)
     
@@ -210,9 +246,16 @@ def main(args):
         with open(expert_metrics_path, "w") as f:
             f.write("Expert Utilization Metrics\n")
             f.write("=========================\n\n")
+            
+            # Include which layers used MoE
+            if "moe_layers_used" in expert_metrics:
+                f.write(f"MoE layers used: {expert_metrics['moe_layers_used']}\n")
+                print(f"MoE layers used: {expert_metrics['moe_layers_used']}")
+            
             for key, value in expert_metrics.items():
-                print(f"{key}: {value}")
-                f.write(f"{key}: {value}\n")
+                if key != "moe_layers_used":  # Avoid duplicate printing
+                    print(f"{key}: {value}")
+                    f.write(f"{key}: {value}\n")
         print(f"Expert metrics saved to: {expert_metrics_path}")
 
 if __name__ == "__main__":
