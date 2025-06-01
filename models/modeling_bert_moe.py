@@ -52,7 +52,6 @@ class BertMoEExpert(nn.Module):
         
         # Create expert's output layer (equivalent to BertOutput but without LayerNorm/residual)
         self.output = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
         
         # Initialize expert weights
         self._init_weights()
@@ -90,7 +89,6 @@ class BertMoEExpert(nn.Module):
         
         # Forward through output layer
         output = self.output(intermediate_output)
-        output = self.dropout(output)
         
         return output
 

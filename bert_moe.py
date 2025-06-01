@@ -175,6 +175,11 @@ def main(args):
         moe_layers=processed_moe_layers,  # Add the MoE layers configuration
     )
     model = BertMoEForSequenceClassification(moe_config)
+    print(model.bert_moe)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    total_params_in_millions = total_params / 1e6
+    print(f"Total number of parameters: {total_params_in_millions:.2f}M")
     
     training_args = TrainingArguments(
         output_dir=args.output_dir,

@@ -112,6 +112,11 @@ def main(args):
         args.model_name_or_path,
         num_labels=num_labels
     )
+    print(model)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    total_params_in_millions = total_params / 1e6
+    print(f"Total number of parameters: {total_params_in_millions:.2f}M")
     
     training_args = TrainingArguments(
         output_dir=args.output_dir,
