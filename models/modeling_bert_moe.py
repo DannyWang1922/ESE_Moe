@@ -22,10 +22,12 @@ from transformers.utils import logging
 from transformers.models.bert.modeling_bert import (
     BertAttention,
     BertEmbeddings,
-    BertPooler    
+    BertPooler,
+    BertSelfAttention, 
+    BertSdpaSelfAttention
 )
 from transformers.models.bert.modeling_bert import *
-
+from transformers.pytorch_utils import find_pruneable_heads_and_indices, prune_linear_layer
 logger = logging.get_logger(__name__)
 
 
@@ -42,16 +44,16 @@ class BertMoEExpert(nn.Module):
         self.config = config
         
         # Create expert's intermediate layer (equivalent to BertIntermediate)
-        self.intermediate = nn.Linear(config.hidden_size, config.intermediate_size)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size)
         
         # Activation function
         if isinstance(config.hidden_act, str):
-            self.intermediate_act_fn = ACT2FN[config.hidden_act]
+            self.act_fn = ACT2FN[config.hidden_act]
         else:
-            self.intermediate_act_fn = config.hidden_act
+            self.act_fn = config.hidden_act
         
         # Create expert's output layer (equivalent to BertOutput but without LayerNorm/residual)
-        self.output = nn.Linear(config.intermediate_size, config.hidden_size)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size)
         
         # Initialize expert weights
         self._init_weights()
@@ -62,14 +64,14 @@ class BertMoEExpert(nn.Module):
         Using specific initialization can help with training stability.
         """
         # Initialize intermediate layer
-        nn.init.normal_(self.intermediate.weight, mean=0.0, std=self.config.initializer_range)
-        if self.intermediate.bias is not None:
-            nn.init.zeros_(self.intermediate.bias)
+        nn.init.normal_(self.up_proj.weight, mean=0.0, std=self.config.initializer_range)
+        if self.up_proj.bias is not None:
+            nn.init.zeros_(self.up_proj.bias)
         
         # Initialize output layer
-        nn.init.normal_(self.output.weight, mean=0.0, std=self.config.initializer_range)
-        if self.output.bias is not None:
-            nn.init.zeros_(self.output.bias)
+        nn.init.normal_(self.down_proj.weight, mean=0.0, std=self.config.initializer_range)
+        if self.down_proj.bias is not None:
+            nn.init.zeros_(self.down_proj.bias)
     
     def forward(self, hidden_states):
         """
@@ -84,11 +86,8 @@ class BertMoEExpert(nn.Module):
                 Processed token representations.
         """
         # Forward through intermediate layer
-        intermediate_output = self.intermediate(hidden_states)
-        intermediate_output = self.intermediate_act_fn(intermediate_output)
-        
-        # Forward through output layer
-        output = self.output(intermediate_output)
+        intermediate_output = self.act_fn(self.up_proj(hidden_states))
+        output = self.down_proj(intermediate_output)
         
         return output
 
@@ -219,9 +218,9 @@ class BertMoEExpertPool(nn.Module):
         return expert_outputs
     
     
-class BertMoERouter(nn.Module):
+class BertMoEGate(nn.Module):
     """
-    Router module for Mixture of Experts BERT model.
+    Gate module for Mixture of Experts BERT model.
     
     This module determines which experts should process each token by computing
     routing probabilities. It takes token representations as input and outputs
@@ -234,13 +233,13 @@ class BertMoERouter(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         
-        # Router projection to calculate expert routing logits
+        # Gate projection to calculate expert routing logits
         # Input: hidden_size, Output: num_experts
-        self.router_weights = nn.Linear(config.hidden_size, self.num_experts, bias=False)
+        self.gate_weights = nn.Linear(config.hidden_size, self.num_experts, bias=False)
         
-        # Initialize router weights - using specific initialization can help with training stability
+        # Initialize gate weights - using specific initialization can help with training stability
         # Here we use Kaiming initialization (aka He initialization)
-        nn.init.kaiming_uniform_(self.router_weights.weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.gate_weights.weight, a=math.sqrt(5))
         
         # Optional: add noise to encourage exploration of different experts
         self.noise_epsilon = config.router_noise_epsilon
@@ -263,153 +262,254 @@ class BertMoERouter(nn.Module):
                 Token representations from which to compute routing probabilities.
                 
         Returns:
-            router_logits: Tensor of shape [batch_size, seq_len, num_experts]
+            gate_logits: Tensor of shape [batch_size, seq_len, num_experts]
                 Logits for routing each token to each expert.
         """
-        # Calculate router logits [batch_size, seq_len, num_experts]
-        router_logits = self.router_weights(hidden_states)
+        # Calculate gate logits [batch_size, seq_len, num_experts]
+        gate_logits = self.gate_weights(hidden_states)
         
         # Optionally add noise during training to encourage exploration
         if self.training and self.training_noise and self.noise_epsilon > 0:
-            router_noise = torch.randn_like(router_logits) * self.noise_epsilon
-            router_logits = router_logits + router_noise
+            gate_noise = torch.randn_like(gate_logits) * self.noise_epsilon
+            gate_logits = gate_logits + gate_noise
         
         # Apply temperature scaling if not 1.0
         if self.temperature != 1.0:
-            router_logits = router_logits / self.temperature
+            gate_logits = gate_logits / self.temperature
             
-        return router_logits
+        return gate_logits
 
-
-    def compute_load_balancing_loss(self, router_logits, router_indices):
-        """
-        Compute auxiliary load balancing loss to encourage equal expert utilization.
+    # def compute_load_balancing_loss(self, gate_logits, gate_indices):
+    #     """
+    #     Compute auxiliary load balancing loss to encourage equal expert utilization.
         
-        This loss encourages a uniform distribution of tokens across experts,
-        which helps prevent the "rich get richer" phenomenon where certain experts
-        receive most of the tokens.
+    #     This loss encourages a uniform distribution of tokens across experts,
+    #     which helps prevent the "rich get richer" phenomenon where certain experts
+    #     receive most of the tokens.
         
-        Args:
-            router_logits: Tensor of shape [batch_size, seq_len, num_experts]
-                Full logits for routing each token to each expert.
-            router_indices: Tensor of shape [batch_size, seq_len, top_k]
-                Indices of selected top-k experts for each token.
+    #     Args:
+    #         gate_logits: Tensor of shape [batch_size, seq_len, num_experts]
+    #             Full logits for routing each token to each expert.
+    #         gate_indices: Tensor of shape [batch_size, seq_len, top_k]
+    #             Indices of selected top-k experts for each token.
                 
-        Returns:
-            load_balancing_loss: Scalar tensor with the load balancing loss.
-        """
-        if not self.use_load_balancing:
-            return torch.tensor(0.0, device=router_logits.device)
+    #     Returns:
+    #         load_balancing_loss: Scalar tensor with the load balancing loss.
+    #     """
+    #     if not self.use_load_balancing:
+    #         return torch.tensor(0.0, device=gate_logits.device)
         
-        batch_size, seq_len, _ = router_logits.shape
+    #     batch_size, seq_len, _ = gate_logits.shape
         
-        # 1. Calculate the fraction of tokens assigned to each expert
-        # Create one-hot encoding for expert assignments
-        # Shape: [batch_size * seq_len * top_k, num_experts]
-        expert_mask = torch.nn.functional.one_hot(
-            router_indices.reshape(-1), 
-            num_classes=self.num_experts
-        ).float()
+    #     # 1. Calculate the fraction of tokens assigned to each expert
+    #     # Create one-hot encoding for expert assignments
+    #     # Shape: [batch_size * seq_len * top_k, num_experts]
+    #     expert_mask = torch.nn.functional.one_hot(
+    #         gate_indices.reshape(-1), 
+    #         num_classes=self.num_experts
+    #     ).float()
         
-        # Sum across all token-expert assignments
-        # Shape: [num_experts]
-        tokens_per_expert = expert_mask.sum(dim=0) / (batch_size * seq_len * self.top_k)
+    #     # Sum across all token-expert assignments
+    #     # Shape: [num_experts]
+    #     tokens_per_expert = expert_mask.sum(dim=0) / (batch_size * seq_len * self.top_k)
         
-        # 2. Calculate the average probability assigned to each expert
-        # First, get the probabilities from logits
-        router_probs = torch.softmax(router_logits, dim=-1)
+    #     # 2. Calculate the average probability assigned to each expert
+    #     # First, get the probabilities from logits
+    #     gate_probs = torch.softmax(gate_logits, dim=-1)
         
-        # Flatten for easier manipulation
-        # Shape: [batch_size * seq_len, num_experts]
-        router_probs_flat = router_probs.reshape(-1, self.num_experts)
+    #     # Flatten for easier manipulation
+    #     # Shape: [batch_size * seq_len, num_experts]
+    #     gate_probs_flat = gate_probs.reshape(-1, self.num_experts)
         
-        # For load balancing, we care about the total probability mass assigned to each expert
-        # Sum probabilities across all tokens for each expert
-        # Shape: [num_experts]
-        mean_expert_probs = router_probs_flat.mean(dim=0)
+    #     # For load balancing, we care about the total probability mass assigned to each expert
+    #     # Sum probabilities across all tokens for each expert
+    #     # Shape: [num_experts]
+    #     mean_expert_probs = gate_probs_flat.mean(dim=0)
         
-        # 3. Calculate load balancing loss using coefficient of variation
-        # This encourages both uniform token distribution and uniform probability distribution
+    #     # 3. Calculate load balancing loss using coefficient of variation
+    #     # This encourages both uniform token distribution and uniform probability distribution
         
-        # Token distribution CV (coefficient of variation)
-        tokens_cv = tokens_per_expert.std() / (tokens_per_expert.mean() + 1e-10)
+    #     # Token distribution CV (coefficient of variation)
+    #     tokens_cv = tokens_per_expert.std() / (tokens_per_expert.mean() + 1e-10)
         
-        # Probability distribution CV
-        probs_cv = mean_expert_probs.std() / (mean_expert_probs.mean() + 1e-10)
+    #     # Probability distribution CV
+    #     probs_cv = mean_expert_probs.std() / (mean_expert_probs.mean() + 1e-10)
         
-        # Combine both aspects of load balancing
-        load_balancing_loss = tokens_cv + probs_cv
+    #     # Combine both aspects of load balancing
+    #     load_balancing_loss = tokens_cv + probs_cv
         
-        # Optional: Add auxiliary z-loss for numerical stability
-        if hasattr(self, 'router_z_loss_coef') and self.router_z_loss_coef > 0:
-            # Z-loss encourages logits to be small to improve stability
-            # z_loss = log(sum(exp(logits)))^2
-            log_z = torch.logsumexp(router_logits, dim=-1)
-            z_loss = torch.mean(log_z ** 2)
-            load_balancing_loss = load_balancing_loss + self.router_z_loss_coef * z_loss
+    #     # Optional: Add auxiliary z-loss for numerical stability
+    #     if hasattr(self, 'router_z_loss_coef') and self.router_z_loss_coef > 0:
+    #         # Z-loss encourages logits to be small to improve stability
+    #         # z_loss = log(sum(exp(logits)))^2
+    #         log_z = torch.logsumexp(gate_logits, dim=-1)
+    #         z_loss = torch.mean(log_z ** 2)
+    #         load_balancing_loss = load_balancing_loss + self.router_z_loss_coef * z_loss
         
-        return load_balancing_loss
-        
+    #     return load_balancing_loss
 
-        
-    def get_routing_weights(self, router_logits):
-        """
-        Calculate routing weights and indices for the top-k experts.
-        
-        Args:
-            router_logits: Tensor of shape [batch_size, seq_len, num_experts]
-                Logits for routing each token to each expert.
-                
-        Returns:
-            router_probs: Tensor of shape [batch_size, seq_len, top_k]
-                Probabilities for routing each token to its top-k experts.
-            router_indices: Tensor of shape [batch_size, seq_len, top_k]
-                Indices of the top-k experts for each token.
-        """
-        # Get the top-k experts for each token
-        router_probs, router_indices = torch.topk(router_logits, self.top_k, dim=-1)
-        
-        # Normalize the routing probabilities for the selected experts
-        router_probs = torch.softmax(router_probs, dim=-1)
-        
-        return router_probs, router_indices
+
+class BertMoEBlock(nn.Module):
+    """
+    MoE Block that combines gating mechanism and expert pool.
+    This module replaces the FFN layer in specific transformer blocks.
+    """
     
-
-class BertMoELayer(nn.Module):
     def __init__(self, config, num_experts=8, top_k=2):
         super().__init__()
         self.config = config
         self.num_experts = num_experts
         self.top_k = top_k
-        self.chunk_size_feed_forward = config.chunk_size_feed_forward
-        self.seq_len_dim = 1
-        self.attention = BertAttention(config)
-        self.is_decoder = config.is_decoder
-        self.add_cross_attention = config.add_cross_attention
-        if self.add_cross_attention:
-            if not self.is_decoder:
-                raise ValueError(f"{self} should be used as a decoder model if cross attention is added")
-            self.crossattention = BertAttention(config, position_embedding_type="absolute")
         
-        # Instead of a single intermediate and output layer, we use a mixture of experts
-        # Create the router for selecting experts
-        self.router = BertMoERouter(config, self.num_experts, self.top_k)
+        # Create the gate for selecting experts
+        self.gate = BertMoEGate(config, num_experts, top_k)
         
         # Create pool of experts (each expert is a feed-forward network)
-        self.expert_pool = BertMoEExpertPool(config, self.num_experts)
+        self.experts = nn.ModuleList([BertMoEExpert(config) for _ in range(num_experts)])
         
-        # Add a layer norm after MoE, similar to original BERT output layer
-        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        # Expert initialization strategy
+        self.expert_init_strategy = config.expert_init_strategy
+        
+        # Apply initialization strategy
+        if self.expert_init_strategy == "diverse":
+            # Initialize experts with different parameters to encourage specialization
+            self._initialize_diverse_experts()
+        
+        # Optional expert dropout for regularization
+        self.expert_dropout = config.expert_dropout
+        
+        # Flag for parallelizing expert computation when possible
+        self.parallel_computation = config.parallel_expert_computation
         
         # For tracking expert usage statistics
         self.expert_metrics = {
             "expert_utilization": torch.zeros(self.num_experts),
         }
+    
+    def _initialize_diverse_experts(self):
+        """
+        Initialize experts with diverse parameters to encourage specialization.
+        
+        This can help experts develop different capabilities by giving them
+        different starting points.
+        """
+        for i, expert in enumerate(self.experts):
+            # Adjust weights slightly for each expert to break symmetry
+            with torch.no_grad():
+                # Scale intermediate weights by a small factor based on expert index
+                scale_factor = 1.0 + (i - self.num_experts // 2) * 0.01
+                expert.intermediate.weight.data *= scale_factor
+                
+                # Optionally, slightly adjust bias terms too
+                if expert.intermediate.bias is not None:
+                    expert.intermediate.bias.data += (i - self.num_experts // 2) * 0.001
+    
+    def forward(self, hidden_states):
+        """
+        Forward pass through MoE block following the equation:
+        FFN^MoE(x') = FFN(x') + sum_{i=1}^{n} x' * ΔW_i^ffn * G^ffn(x')_i
+        
+        Args:
+            hidden_states: Tensor of shape [batch_size, seq_len, hidden_size]
+                Input hidden states (x' in the equation)
+                
+        Returns:
+            output: Tensor of shape [batch_size, seq_len, hidden_size]
+                MoE processed output
+        """
+        batch_size, seq_len, hidden_size = hidden_states.shape
+        
+        # Get gating logits and routing decisions
+        router_logits = self.gate(hidden_states)
+        routing_weights = torch.softmax(router_logits, dim=-1)
+        routing_weights, selected_experts_indices = torch.topk(routing_weights, self.top_k, dim=-1)
+        
+        # Store for load balancing loss computation
+        self._last_gate_logits = router_logits
+        self._last_gate_indices = selected_experts_indices
+        
+        # Initialize output tensor for accumulating expert outputs
+        moe_output = torch.zeros_like(hidden_states)
+        
+        # Track which experts are used
+        expert_counts = torch.zeros(self.num_experts, device=hidden_states.device)
+        
+        # Process tokens through selected experts
+        for expert_idx in range(self.num_experts):
+            # Find which tokens are routed to this expert
+            expert_mask = (selected_experts_indices == expert_idx)
+            
+            if expert_mask.any():
+                # Count how many tokens use this expert
+                expert_counts[expert_idx] = expert_mask.sum().item()
+                
+                # Get indices and probabilities for tokens routed to this expert
+                batch_indices, seq_indices, k_indices = expert_mask.nonzero(as_tuple=True)
+                
+                # Get the corresponding gate probabilities
+                token_probs = routing_weights[batch_indices, seq_indices, k_indices]
+                
+                # Get the hidden states for these tokens
+                token_hidden_states = hidden_states[batch_indices, seq_indices]
+                
+                # Apply expert dropout during training
+                if self.training and self.expert_dropout > 0 and torch.rand(1).item() < self.expert_dropout:
+                    continue
+                
+                # Forward through the expert (this computes ΔW_i^ffn)
+                expert_output = self.experts[expert_idx](token_hidden_states)
+                
+                # Scale by gate probabilities and input (x' * ΔW_i^ffn * G^ffn(x')_i)
+                # Note: The multiplication by x' is implicit in the residual connection
+                scaled_expert_output = expert_output * token_probs.unsqueeze(-1)
+                
+                # Accumulate the expert outputs
+                moe_output[batch_indices, seq_indices] += scaled_expert_output
+        
+        # Update expert utilization metrics
+        device = expert_output.device
+        self.expert_metrics["expert_utilization"] = expert_counts / (batch_size * seq_len * self.top_k)
+        self.expert_metrics["expert_utilization"] = self.expert_metrics["expert_utilization"].to(device)
+        return moe_output
+    
+    # def get_load_balancing_loss(self):
+    #     """Get the load balancing loss from the gate."""
+    #     if hasattr(self, '_last_gate_logits') and hasattr(self, '_last_gate_indices'):
+    #         return self.gate.compute_load_balancing_loss(
+    #             self._last_gate_logits, 
+    #             self._last_gate_indices
+    #         )
+    #     return torch.tensor(0.0)
 
-        # Add these attributes to store router outputs
-        self._last_router_probs = None
-        self._last_router_indices = None
+BERT_SELF_ATTENTION_CLASSES = {
+    "eager": BertSelfAttention,
+    "sdpa": BertSdpaSelfAttention,
+}
+
+class BertAttentionOnly(nn.Module):
+    def __init__(self, config, position_embedding_type=None):
+        super().__init__()
+        self.self = BERT_SELF_ATTENTION_CLASSES[config._attn_implementation](
+            config, position_embedding_type=position_embedding_type
+        )
+        self.pruned_heads = set()
+
+    def prune_heads(self, heads):
+        if len(heads) == 0:
+            return
+        heads, index = find_pruneable_heads_and_indices(
+            heads, self.self.num_attention_heads, self.self.attention_head_size, self.pruned_heads
+        )
+
+        # Prune linear layers
+        self.self.query = prune_linear_layer(self.self.query, index)
+        self.self.key = prune_linear_layer(self.self.key, index)
+        self.self.value = prune_linear_layer(self.self.value, index)
+
+        # Update hyper params and store pruned heads
+        self.self.num_attention_heads = self.self.num_attention_heads - len(heads)
+        self.self.all_head_size = self.self.attention_head_size * self.self.num_attention_heads
+        self.pruned_heads = self.pruned_heads.union(heads)
 
     def forward(
         self,
@@ -421,6 +521,59 @@ class BertMoELayer(nn.Module):
         past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
         output_attentions: Optional[bool] = False,
     ) -> Tuple[torch.Tensor]:
+        self_outputs = self.self(
+            hidden_states,
+            attention_mask,
+            head_mask,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            past_key_value,
+            output_attentions,
+        )
+        attention_output = self_outputs[0]
+        outputs = (attention_output,) + self_outputs[1:]
+        return outputs
+
+class BertMoELayer(nn.Module):
+    def __init__(self, config, num_experts=8, top_k=2):
+        super().__init__()
+        self.config = config
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.chunk_size_feed_forward = config.chunk_size_feed_forward
+        self.seq_len_dim = 1    
+        
+        self.is_decoder = config.is_decoder
+        self.add_cross_attention = config.add_cross_attention
+        if self.add_cross_attention:
+            if not self.is_decoder:
+                raise ValueError(f"{self} should be used as a decoder model if cross attention is added")
+            self.crossattention = BertAttentionOnly(config, position_embedding_type="absolute")
+        
+        self.attention = BertAttentionOnly(config)
+        self.layer_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        # MoE Block (combines gate and expert)
+        self.moe_block = BertMoEBlock(config, num_experts, top_k)
+        # For tracking expert usage statistics
+        self.expert_metrics = {
+            "expert_utilization": torch.zeros(self.num_experts),
+        }
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        past_key_value: Optional[Tuple[Tuple[torch.FloatTensor]]] = None,
+        output_attentions: Optional[bool] = False,
+    ) -> Tuple[torch.Tensor]:
+        
+        residual = hidden_states
+
+        hidden_states = self.layer_norm(hidden_states)
+
         # decoder uni-directional self-attention cached key/values tuple is at positions 1,2
         self_attn_past_key_value = past_key_value[:2] if past_key_value is not None else None
         self_attention_outputs = self.attention(
@@ -465,8 +618,19 @@ class BertMoELayer(nn.Module):
             cross_attn_present_key_value = cross_attention_outputs[-1]
             present_key_value = present_key_value + cross_attn_present_key_value
         
-        # MoE feed-forward part (replacing the original feed_forward_chunk)
-        layer_output = self.moe_feed_forward(attention_output)
+
+        hidden_states = residual + attention_output
+       
+        # Fully Connected
+        residual = hidden_states
+        hidden_states = self.layer_norm(hidden_states)
+        moe_output = self.moe_block(hidden_states)   
+        layer_output = residual  + moe_output
+
+        device = hidden_states.device
+        utilization = self.moe_block.expert_metrics.get(
+            "expert_utilization", torch.zeros(self.num_experts, device=device))
+        self.expert_metrics["expert_utilization"] = utilization.to(device)
 
         outputs = (layer_output,) + outputs
 
@@ -476,94 +640,6 @@ class BertMoELayer(nn.Module):
 
         return outputs
 
-    def moe_feed_forward(self, attention_output):
-        """
-        Mixture of Experts feed-forward network that replaces the original feed_forward_chunk.
-        
-        This method:
-        1. Gets routing probabilities from the router
-        2. Selects top-k experts for each token
-        3. Dispatches tokens to their assigned experts
-        4. Combines outputs according to routing weights
-        5. Applies dropout and residual connection
-        """
-        batch_size, seq_len, hidden_size = attention_output.shape
-        
-        # Get routing probabilities and indices from router
-        # Shape: router_probs [batch_size, seq_len, top_k], router_indices [batch_size, seq_len, top_k]
-        router_logits = self.router(attention_output)
-        
-        # Select top-k experts and their probabilities
-        router_probs, router_indices = torch.topk(router_logits, self.top_k, dim=-1)
-        router_probs_normalized = torch.softmax(router_probs, dim=-1)
-
-        # Store for load balancing loss computation
-        self._last_router_probs = router_logits  # Store full logits, not just top-k
-        self._last_router_indices = router_indices
-        
-        # Prepare inputs for experts
-        # Reshape inputs to [batch_size * seq_len, hidden_size]
-        flat_input = attention_output.reshape(-1, hidden_size)
-        
-        # Create tensor to collect outputs from all experts
-        expert_outputs = torch.zeros(
-            batch_size * seq_len, 
-            hidden_size, 
-            device=attention_output.device,
-            dtype=attention_output.dtype
-        )
-        
-        # Track which experts are used
-        expert_counts = torch.zeros(self.num_experts, device=attention_output.device)
-        
-        # For each expert
-        for expert_idx in range(self.num_experts):
-            # Find which tokens are routed to this expert
-            # Create a mask [batch_size, seq_len, top_k] for tokens assigned to this expert
-            expert_mask = (router_indices == expert_idx)
-            
-            if expert_mask.any():
-                # Count how many tokens use this expert
-                expert_counts[expert_idx] = expert_mask.sum().item()
-                
-                # Get indices of tokens routed to this expert
-                # Flatten the mask to [batch_size * seq_len, top_k]
-                flat_mask = expert_mask.reshape(-1, self.top_k)
-                
-                # Get indices of tokens that use this expert
-                token_indices = flat_mask.any(dim=-1).nonzero().squeeze(-1)
-                
-                # Get the routing probabilities for these tokens to this expert
-                # Find positions where this expert appears in top-k
-                prob_positions = expert_mask.nonzero()
-                batch_indices, seq_indices, k_indices = prob_positions[:, 0], prob_positions[:, 1], prob_positions[:, 2]
-                token_probs = router_probs_normalized[batch_indices, seq_indices, k_indices]
-                
-                # Get inputs for this expert
-                expert_inputs = flat_input[token_indices]
-                
-                # Forward through the expert
-                expert_output = self.expert_pool.forward_expert(expert_idx, expert_inputs)
-                
-                # Scale outputs by routing probabilities
-                scaled_expert_output = expert_output * token_probs.unsqueeze(-1)
-                
-                # Combine outputs at the appropriate positions
-                # Use index_add_ to handle cases where tokens are routed to same expert multiple times
-                expert_outputs.index_add_(0, token_indices, scaled_expert_output)
-        
-        # Update expert utilization metrics
-        self.expert_metrics["expert_utilization"] = expert_counts / (batch_size * seq_len * self.top_k)
-        
-        # Reshape back to [batch_size, seq_len, hidden_size]
-        combined_output = expert_outputs.reshape(batch_size, seq_len, hidden_size)
-        
-        # Apply dropout and layer norm with residual connection
-        combined_output = self.dropout(combined_output)
-        final_output = self.layer_norm(combined_output + attention_output)
-        
-        return final_output
-        
 
 class BertMoEEncoder(nn.Module): 
     def __init__(self, config):
