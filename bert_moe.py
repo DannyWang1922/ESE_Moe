@@ -86,6 +86,8 @@ def parse_args():
     parser.add_argument("--eval_steps", type=int, default=config.get("eval_steps", 500))
     parser.add_argument("--save_steps", type=int, default=config.get("save_steps", 500))
     parser.add_argument("--fp16", type=bool, default=config.get("fp16", False))
+    parser.add_argument("--num_samples", type=int, default=config.get("num_samples", 10),
+                    help="Number of samples to use from the dataset. Use -1 to use the full dataset.")
 
     # MoE specific arguments
     parser.add_argument("--num_experts", type=int, default=config.get("num_experts", 8))
@@ -149,6 +151,9 @@ def main(args):
     
     dataset = load_dataset(args.task)
     num_labels = len(dataset["train"].features["label"].names)
+
+    if hasattr(args, "num_samples") and args.num_samples is not None:
+        dataset["train"] = dataset["train"].select(range(min(args.num_samples, len(dataset["train"]))))
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     tokenize_with_args = partial(tokenize_func, tokenizer=tokenizer, max_length=args.max_length)
