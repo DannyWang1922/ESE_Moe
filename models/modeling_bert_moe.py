@@ -467,7 +467,7 @@ class BertMoEBlock(nn.Module):
                 moe_output[batch_indices, seq_indices] += scaled_expert_output
         
         # Update expert utilization metrics
-        device = expert_output.device
+        device = hidden_states.device
         self.expert_metrics["expert_utilization"] = expert_counts / (batch_size * seq_len * self.top_k)
         self.expert_metrics["expert_utilization"] = self.expert_metrics["expert_utilization"].to(device)
         return moe_output
